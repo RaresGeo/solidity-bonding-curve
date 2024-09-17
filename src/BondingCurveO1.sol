@@ -46,15 +46,18 @@ contract BondingCurve is OwnableUpgradeable {
         uint256 tokenAmount
     );
 
-    // State Variables
-    uint256 public LAUNCH_FEE;
-    uint256 public LAUNCH_THRESHOLD;
-    uint256 public LAUNCH_ETH_RESERVE;
-    uint256 public TOKEN_SUPPLY;
-    uint256 public TOTAL_SALE;
-    uint256 public VIRTUAL_TOKEN_RESERVE_AMOUNT;
-    uint256 public VIRTUAL_ETH_RESERVE_AMOUNT;
+    uint256 public constant LAUNCH_FEE = 3_000_000_000;
+    uint256 public constant LAUNCH_THRESHOLD =
+        200_000_000_000_000_000_000_000_000;
+    uint256 public constant LAUNCH_ETH_RESERVE = 138_000_000_000;
+    uint256 public constant TOKEN_SUPPLY =
+        1_000_000_000_000_000_000_000_000_000;
+    uint256 public constant TOTAL_SALE = 800_000_000_000_000_000_000_000_000;
+    uint256 public constant VIRTUAL_TOKEN_RESERVE_AMOUNT =
+        70_000_000_000_000_000_000_000_000;
+    uint256 public constant VIRTUAL_ETH_RESERVE_AMOUNT = 35_000_000_000;
 
+    // State Variables
     address public deadAddress;
     address public implementation;
     uint256 public launchFee;
@@ -71,6 +74,7 @@ contract BondingCurve is OwnableUpgradeable {
     address public vault;
 
     uint256 public tokenCount;
+    bool public pause;
 
     // Mappings
     mapping(uint256 => address) public tokenAddress;
@@ -88,26 +92,27 @@ contract BondingCurve is OwnableUpgradeable {
         address _vault,
         address _v2Router,
         uint256 _saleFee,
-        uint256 _purchaseFee
+        uint256 _purchaseFee,
+        uint256 _mintFee,
+        uint256 _minTxFee,
+        uint256 _maxPurchaseAmount,
+        address _owner
     ) external initializer {
-        __Ownable_init();
+        __Ownable_init(_owner);
         vault = _vault;
         v2Router = _v2Router;
         saleFee = _saleFee;
         purchaseFee = _purchaseFee;
+        mintFee = _mintFee;
+        minTxFee = _minTxFee;
+        maxPurchaseAmount = _maxPurchaseAmount;
 
         // Set default values (can be adjusted later by the owner)
-        LAUNCH_FEE = 1 ether;
-        LAUNCH_THRESHOLD = 100 ether;
-        LAUNCH_ETH_RESERVE = 1000 ether;
-        TOKEN_SUPPLY = 1e9 * 1e18; // 1 billion tokens with 18 decimals
-        VIRTUAL_TOKEN_RESERVE_AMOUNT = 1e6 * 1e18;
-        VIRTUAL_ETH_RESERVE_AMOUNT = 1000 ether;
+        // DANIEL'S NOTE: not sure what this dead address does. The LLM did not generate any use for it. I assume it is for burning tokens.
         deadAddress = address(0xdead);
-        launchFee = 1 ether;
-        maxPurchaseAmount = 100 ether;
-        minTxFee = 0.01 ether;
-        mintFee = 0.1 ether;
+        launchFee = LAUNCH_FEE;
+        // DANIEL'S NOTE: operator also does not do anything in this contract. I have allowed it to be different from the owner.
+        operator = msg.sender;
     }
 
     // Ownership functions
@@ -127,6 +132,7 @@ contract BondingCurve is OwnableUpgradeable {
     }
 
     // Operator functions
+    // DANIEL'S NOTE: Again, this is not doing anything currently.
     function setOperator(address newOperator) external onlyOwner {
         emit OperatorChanged(operator, newOperator);
         operator = newOperator;
@@ -150,6 +156,7 @@ contract BondingCurve is OwnableUpgradeable {
         minTxFee = newFee;
     }
 
+    // DANIEL'S NOTE: I'm not sure why there is a mint fee
     function setMintFee(uint256 newFee) external onlyOwner {
         emit MintFeeSet(mintFee, newFee);
         mintFee = newFee;
@@ -171,8 +178,15 @@ contract BondingCurve is OwnableUpgradeable {
         string calldata symbol
     ) external payable {
         require(!pause, "BondingCurve: Contract is paused");
-        require(msg.value >= mintFee, "BondingCurve: Insufficient mint fee");
-        uint256 initialFunds = msg.value - mintFee;
+        require(
+            msg.value >= LAUNCH_FEE + mintFee,
+            "BondingCurve: Insufficient fees"
+        );
+
+        uint256 initialFunds = msg.value - LAUNCH_FEE - mintFee;
+
+        // Transfer LAUNCH_FEE to vault
+        payable(vault).transfer(LAUNCH_FEE);
 
         // Create new token
         Token newToken = new Token(name, symbol, TOKEN_SUPPLY, address(this));
@@ -181,7 +195,7 @@ contract BondingCurve is OwnableUpgradeable {
         tokenAddress[tokenCount] = newTokenAddress;
         tokenCreator[newTokenAddress] = msg.sender;
 
-        // Initialize virtual pool
+        // Initialize virtual pool with constants
         virtualPools[newTokenAddress] = VirtualPool({
             ETHReserve: VIRTUAL_ETH_RESERVE_AMOUNT,
             TokenReserve: VIRTUAL_TOKEN_RESERVE_AMOUNT,
@@ -190,7 +204,7 @@ contract BondingCurve is OwnableUpgradeable {
 
         emit TokenCreate(newTokenAddress, tokenCount, msg.sender);
 
-        // Purchase initial tokens
+        // Purchase initial tokens using the bonding curve
         uint256 tokenAmount = getTokenAmountByPurchase(
             newTokenAddress,
             initialFunds
@@ -231,6 +245,10 @@ contract BondingCurve is OwnableUpgradeable {
             !virtualPools[token].launched,
             "BondingCurve: Token already launched"
         );
+        require(
+            msg.value <= maxPurchaseAmount,
+            "BondingCurve: Exceeds max purchase amount"
+        );
 
         uint256 ethAmount = msg.value;
         uint256 fee = (ethAmount * purchaseFee) / 1e18;
@@ -242,6 +260,10 @@ contract BondingCurve is OwnableUpgradeable {
         // Calculate token amount to send
         uint256 tokenAmount = getTokenAmountByPurchase(token, netAmount);
         require(tokenAmount >= amountMin, "BondingCurve: Slippage exceeded");
+
+        // Transfer fee to vault
+        // DANIEL'S NOTE: I moved this, it happened after emitting the event before. But it's better to transfer the fee first. To avoid reentrancy attacks.
+        payable(vault).transfer(fee);
 
         // Update reserves
         virtualPools[token].ETHReserve += netAmount;
@@ -260,11 +282,12 @@ contract BondingCurve is OwnableUpgradeable {
             virtualPools[token].TokenReserve
         );
 
-        // Transfer fee to vault
-        payable(vault).transfer(fee);
+        // Check if the token should be launched
+        checkAndLaunchToken(token);
     }
 
     // Sell Token
+    // DANIEL'S NOTE: This function name looks like a typo. It should be "sellToken" instead
     function saleToken(
         address token,
         uint256 tokenAmount,
@@ -292,6 +315,10 @@ contract BondingCurve is OwnableUpgradeable {
         uint256 netAmount = ethAmount - fee;
         require(netAmount >= amountMin, "BondingCurve: Slippage exceeded");
 
+        // Transfer fee to vault
+        // DANIEL'S NOTE: I also moved this, it was after emitting the event before. But it's better to transfer the fee first. To avoid reentrancy attacks.
+        payable(vault).transfer(fee);
+
         // Update reserves
         virtualPools[token].ETHReserve -= netAmount;
         virtualPools[token].TokenReserve += tokenAmount;
@@ -301,9 +328,6 @@ contract BondingCurve is OwnableUpgradeable {
 
         // Emit event
         emit TokenSold(token, msg.sender, ethAmount, fee, tokenAmount);
-
-        // Transfer fee to vault
-        payable(vault).transfer(fee);
     }
 
     // Get Token Amount By Purchase
@@ -317,11 +341,16 @@ contract BondingCurve is OwnableUpgradeable {
             "BondingCurve: Invalid reserves"
         );
 
-        // Bonding curve formula (e.g., constant product)
-        // Adjust the formula according to your bonding curve design
-        tokenAmount =
-            (ethAmount * pool.TokenReserve) /
-            (pool.ETHReserve + ethAmount);
+        uint256 tokenReserve = pool.TokenReserve;
+        uint256 ethReserve = pool.ETHReserve;
+
+        // Bonding curve formula using constant product market maker (CPMM)
+        // DANIEL'S NOTE: This is essentially the bonding curve formula. We should decide on a formula and change this
+        // DANIEL'S NOTE: I think we will use an exponential curve in the future.
+        uint256 k = tokenReserve * ethReserve;
+        uint256 newEthReserve = ethReserve + ethAmount;
+        uint256 newTokenReserve = k / newEthReserve;
+        tokenAmount = tokenReserve - newTokenReserve;
     }
 
     // Get ETH Amount By Sale
@@ -335,11 +364,25 @@ contract BondingCurve is OwnableUpgradeable {
             "BondingCurve: Invalid reserves"
         );
 
-        // Bonding curve formula (e.g., constant product)
-        // Adjust the formula according to your bonding curve design
-        ethAmount =
-            (tokenAmount * pool.ETHReserve) /
-            (pool.TokenReserve + tokenAmount);
+        uint256 tokenReserve = pool.TokenReserve;
+        uint256 ethReserve = pool.ETHReserve;
+
+        // Bonding curve formula using constant product market maker (CPMM)
+        // DANIEL'S NOTE: Same as the purchase function, we should decide on a formula and change this
+        uint256 k = tokenReserve * ethReserve;
+        uint256 newTokenReserve = tokenReserve + tokenAmount;
+        uint256 newEthReserve = k / newTokenReserve;
+        ethAmount = ethReserve - newEthReserve;
+    }
+
+    // Enforce Launch Threshold
+    function checkAndLaunchToken(address token) internal {
+        VirtualPool storage pool = virtualPools[token];
+        if (!pool.launched && pool.ETHReserve >= LAUNCH_THRESHOLD) {
+            pool.launched = true;
+            // DANIEL'S NOTE: I am unsure if we can launch the token here. I guess we might have to listen for this event on our backend and then launch the token on the DEX.
+            emit TokenLaunched(token);
+        }
     }
 
     // Pause and Unpause
