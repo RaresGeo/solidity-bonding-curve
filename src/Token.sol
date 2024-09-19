@@ -12,4 +12,8 @@ contract Token is ERC20 {
     ) ERC20(_name, _symbol) {
         _mint(_owner, _initialSupply);
     }
+
+    function burn(uint256 _amount) public {
+        _burn(msg.sender, _amount);
+    }
 }
