@@ -49,6 +49,15 @@ contract DeployBondingCurve is Script {
             initializerData
         );
 
+        // Try to manually initialize, in case it failed
+        bondingCurve.initialize(
+            vault,
+            factory,
+            router,
+            maxPurchaseAmount,
+            owner
+        );
+
         vm.stopBroadcast();
 
         // Output the deployed addresses
