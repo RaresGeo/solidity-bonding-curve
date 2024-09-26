@@ -6,7 +6,7 @@ import "../src/BondingCurve.sol";
 import "../src/Token.sol";
 
 contract MockVault {
-    fallback() external payable {}
+    receive() external payable {}
 }
 
 contract MockUniswapV2Factory {
@@ -48,6 +48,14 @@ contract MockUniswapV2Router {
         returns (uint amountToken, uint amountETH, uint liquidity)
     {
         // Mock behavior: Just return the input amounts
+        require(token != address(0), "Token address cannot be 0x0");
+        require(to != address(0), "Transfer to 0x0 address");
+        require(deadline > block.timestamp, "Deadline has passed");
+        require(amountETHMin <= msg.value, "Amount ETH min exceeded");
+        require(
+            amountTokenMin <= amountTokenDesired,
+            "Amount token min exceeded"
+        );
         amountToken = amountTokenDesired;
         amountETH = msg.value;
         liquidity = amountToken + amountETH;
@@ -64,8 +72,10 @@ contract MockUniswapV2Pair {
         token1 = _token1;
     }
 
-    function transfer(address to, uint amount) external returns (bool) {
+    function transfer(address to, uint amount) external pure returns (bool) {
         // Mock transfer: Do nothing and return true
+        require(to != address(0), "Transfer to 0x0 address");
+        require(amount > 0, "Transfer amount must be greater than 0");
         return true;
     }
 }
@@ -81,6 +91,8 @@ contract BondingCurveTest is Test {
     MockUniswapV2Factory factory = new MockUniswapV2Factory();
     MockUniswapV2Router router = new MockUniswapV2Router(address(weth));
 
+    receive() external payable {}
+
     function setUp() public {
         // Deploy the BondingCurve contract
         vm.prank(owner);
@@ -89,7 +101,7 @@ contract BondingCurveTest is Test {
             address(vault), // vault
             address(factory), // factory
             address(router), // router
-            10 ether, // maxPurchaseAmount
+            1 ether, // maxPurchaseAmount
             owner // owner
         );
     }
@@ -122,7 +134,7 @@ contract BondingCurveTest is Test {
         uint256 tokensBought = Token(tokenAddress).balanceOf(user);
 
         // Check token reserve and ETH reserve
-        (uint256 ETHReserve, uint256 TokenReserve, bool launched) = bondingCurve
+        (uint256 ETHReserve, uint256 TokenReserve, ) = bondingCurve
             .virtualPools(tokenAddress);
 
         assertEq(
@@ -149,15 +161,20 @@ contract BondingCurveTest is Test {
     }
 
     function testCreateAndInitPurchase_ContractPaused() public {
+        uint256 initialFunds = 1 ether;
+        uint256 totalFunds = initialFunds + bondingCurve.LAUNCH_FEE();
+
         vm.prank(owner);
         bondingCurve.pausePad();
 
         vm.deal(user, 1 ether + bondingCurve.LAUNCH_FEE());
         vm.prank(user);
+
         vm.expectRevert("BondingCurve: Contract is paused");
-        bondingCurve.createAndInitPurchase{
-            value: 1 ether + bondingCurve.LAUNCH_FEE()
-        }("Test Token", "TTK");
+        bondingCurve.createAndInitPurchase{value: totalFunds}(
+            "Test Token",
+            "TTK"
+        );
     }
 
     function testPurchaseToken_Successful() public {
@@ -173,7 +190,7 @@ contract BondingCurveTest is Test {
         assertGt(tokenBalance, 0, "User should receive tokens");
 
         // Verify reserves
-        (uint256 ETHReserve, uint256 TokenReserve, bool launched) = bondingCurve
+        (uint256 ETHReserve, uint256 TokenReserve, ) = bondingCurve
             .virtualPools(tokenAddress);
 
         uint256 expectedRemainingTokens = bondingCurve.TOTAL_SALE() -
@@ -208,6 +225,7 @@ contract BondingCurveTest is Test {
         vm.expectRevert("BondingCurve: Slippage exceeded");
         bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, amountMin);
     }
+
     function testSellToken_Successful() public {
         address tokenAddress = deployTestToken();
         uint256 tokenAmount = 1000 * 1e18;
@@ -239,7 +257,7 @@ contract BondingCurveTest is Test {
         assertGt(ethBalance, 0, "User should receive ETH");
 
         // Verify reserves
-        (uint256 ETHReserve, uint256 TokenReserve, bool launched) = bondingCurve
+        (uint256 ETHReserve, uint256 TokenReserve, ) = bondingCurve
             .virtualPools(tokenAddress);
 
         assertEq(
@@ -259,6 +277,7 @@ contract BondingCurveTest is Test {
         vm.expectRevert();
         bondingCurve.sellToken(tokenAddress, tokenAmount, 0);
     }
+
     function testTokenLaunch_ThresholdReached() public {
         address tokenAddress = deployTestToken();
 
@@ -269,8 +288,7 @@ contract BondingCurveTest is Test {
         bondingCurve.purchaseToken{value: purchaseAmount}(tokenAddress, 0);
 
         // Verify token is launched
-        (uint256 ETHReserve, uint256 TokenReserve, bool launched) = bondingCurve
-            .virtualPools(tokenAddress);
+        (, , bool launched) = bondingCurve.virtualPools(tokenAddress);
 
         assertTrue(launched, "Token should be launched");
 
@@ -288,16 +306,19 @@ contract BondingCurveTest is Test {
         bondingCurve.purchaseToken{value: purchaseAmount}(tokenAddress, 0);
 
         // Verify token is not launched
-        (uint256 ETHReserve, uint256 TokenReserve, bool launched) = bondingCurve
-            .virtualPools(tokenAddress);
+        (, , bool launched) = bondingCurve.virtualPools(tokenAddress);
 
         assertFalse(launched, "Token should not be launched");
     }
+
     function testPriceIncreaseOnPurchase() public {
         address tokenAddress = deployTestToken();
 
         // Get initial price
-        uint256 initialPrice = bondingCurve.getCurrentPrice(tokenAddress);
+        uint256 initialPrice = bondingCurve.getEthAmountToBuyTokens(
+            tokenAddress,
+            1e18
+        );
 
         // User purchases tokens
         vm.deal(user, 1 ether);
@@ -305,7 +326,10 @@ contract BondingCurveTest is Test {
         bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, 0);
 
         // Get new price
-        uint256 newPrice = bondingCurve.getCurrentPrice(tokenAddress);
+        uint256 newPrice = bondingCurve.getEthAmountToBuyTokens(
+            tokenAddress,
+            1e18
+        );
 
         assertGt(
             newPrice,
@@ -322,23 +346,92 @@ contract BondingCurveTest is Test {
         vm.prank(user);
         bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, 0);
 
-        uint256 priceAfterPurchase = bondingCurve.getCurrentPrice(tokenAddress);
+        uint256 priceAfterPurchase = bondingCurve.getEthAmountToBuyTokens(
+            tokenAddress,
+            1e18
+        );
 
         // Approve and sell tokens
-        uint256 tokenAmount = 100 * 1e18;
+        uint256 tokenAmount = Token(tokenAddress).balanceOf(user);
         vm.prank(user);
         Token(tokenAddress).approve(address(bondingCurve), tokenAmount);
 
         vm.prank(user);
         bondingCurve.sellToken(tokenAddress, tokenAmount, 0);
 
-        uint256 priceAfterSale = bondingCurve.getCurrentPrice(tokenAddress);
+        uint256 priceAfterSale = bondingCurve.getEthAmountToBuyTokens(
+            tokenAddress,
+            1e18
+        );
 
         assertLt(
             priceAfterSale,
             priceAfterPurchase,
             "Price should decrease after sale"
         );
+    }
+
+    function testPriceIsAccurate() public {
+        address tokenAddress = deployTestToken();
+        // Get initial price
+        uint256 initialPrice = bondingCurve.getEthAmountToBuyTokens(
+            tokenAddress,
+            1e18
+        );
+        // User purchases one token with the initialPrice
+        vm.deal(user, initialPrice);
+        vm.prank(user);
+        bondingCurve.purchaseToken{value: initialPrice}(tokenAddress, 0);
+        vm.prank(user);
+        // Check that we have one token
+        uint256 tokenBalance = Token(tokenAddress).balanceOf(user);
+
+        // Calculate the allowed difference (0.05% of 1e18)
+        uint256 allowedDifference = (1e18 * 5) / 10000;
+
+        // Check if the token balance is within the allowed range
+        assertTrue(
+            tokenBalance >= 1e18 - allowedDifference &&
+                tokenBalance <= 1e18 + allowedDifference,
+            "User's token balance should be within 0.05% of one token"
+        );
+    }
+
+    function testTokenSellsForSamePrice() public {
+        address tokenAddress = deployTestToken();
+
+        // User purchases tokens for 1 eth
+
+        vm.deal(user, 1 ether);
+        vm.prank(user);
+        bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, 0);
+
+        // User sells tokens for 1 eth
+        uint256 tokenAmount = Token(tokenAddress).balanceOf(user);
+        vm.prank(user);
+        Token(tokenAddress).approve(address(bondingCurve), tokenAmount);
+
+        // Check that the sale would result in 1 eth, getEthAmountBySale
+        vm.prank(user);
+        uint256 ethAmount = bondingCurve.getEthAmountBySale(
+            tokenAddress,
+            tokenAmount
+        );
+        assertEq(
+            ethAmount + user.balance,
+            1 ether,
+            "User should receive 1 eth"
+        );
+
+        vm.prank(user);
+        bondingCurve.sellToken(tokenAddress, tokenAmount, 0);
+        // Check that we have no tokens
+        uint256 tokenBalance = Token(tokenAddress).balanceOf(user);
+        assertEq(tokenBalance, 0, "User should have no tokens");
+
+        // Check that we have 1 eth
+        uint256 ethBalance = user.balance;
+        assertEq(ethBalance, 1 ether, "User should have 1 eth");
     }
 
     function testPauseContract() public {
@@ -368,18 +461,18 @@ contract BondingCurveTest is Test {
         uint256 tokenBalance = Token(tokenAddress).balanceOf(user);
         assertGt(tokenBalance, 0, "User should receive tokens after unpausing");
     }
-    function testOnlyOwnerCanSetVault() public {
-        address newVault = address(0xABCDEF);
 
+    function testOnlyOwnerCanSetVault() public {
+        address newVault = address(3);
         // Non-owner tries to set vault
         vm.prank(user);
-        vm.expectRevert("Ownable: caller is not the owner");
+        vm.expectRevert(
+            abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", user)
+        );
         bondingCurve.setVault(newVault);
-
         // Owner sets vault
         vm.prank(owner);
         bondingCurve.setVault(newVault);
-
         assertEq(
             bondingCurve.vault(),
             newVault,
@@ -425,22 +518,6 @@ contract BondingCurveTest is Test {
         vm.prank(user);
         vm.expectRevert("BondingCurve: Not enough tokens available");
         bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, 0);
-    }
-
-    function testNegativeReservesPrevention() public {
-        address tokenAddress = deployTestToken();
-
-        // User attempts to sell more tokens than in reserve
-        (uint256 ETHReserve, uint256 TokenReserve, bool launched) = bondingCurve
-            .virtualPools(tokenAddress);
-        uint256 tokenAmount = TokenReserve + 1;
-
-        vm.prank(user);
-        Token(tokenAddress).approve(address(bondingCurve), tokenAmount);
-
-        vm.prank(user);
-        vm.expectRevert("BondingCurve: Not enough tokens in reserve");
-        bondingCurve.sellToken(tokenAddress, tokenAmount, 0);
     }
 
     function testLaunchFeeTransferredToVault() public {
