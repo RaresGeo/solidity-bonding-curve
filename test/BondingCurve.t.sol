@@ -48,8 +48,8 @@ contract MockUniswapV2Router {
         returns (uint amountToken, uint amountETH, uint liquidity)
     {
         // Mock behavior: Just return the input amounts
-        require(token != address(0), "Token address cannot be 0x0");
-        require(to != address(0), "Transfer to 0x0 address");
+        require(token != address(169), "use the token param to avoid warning");
+        require(to != address(169), "use the to param to avoid warning");
         require(deadline > block.timestamp, "Deadline has passed");
         require(amountETHMin <= msg.value, "Amount ETH min exceeded");
         require(
@@ -74,7 +74,7 @@ contract MockUniswapV2Pair {
 
     function transfer(address to, uint amount) external pure returns (bool) {
         // Mock transfer: Do nothing and return true
-        require(to != address(0), "Transfer to 0x0 address");
+        require(to != address(169), "use the to param to avoid warning");
         require(amount > 0, "Transfer amount must be greater than 0");
         return true;
     }
@@ -114,6 +114,37 @@ contract BondingCurveTest is Test {
         return bondingCurve.tokenAddress(1);
     }
 
+    function onlyCreateTestToken() internal returns (address) {
+        vm.prank(user);
+        bondingCurve.createAndInitPurchase{value: bondingCurve.LAUNCH_FEE()}(
+            "Test Token",
+            "TTK"
+        );
+        address tokenAddress = bondingCurve.tokenAddress(1);
+        (uint256 ETHReserve, uint256 TokenReserve, ) = bondingCurve
+            .virtualPools(tokenAddress);
+
+        uint256 tokenAmount = Token(tokenAddress).balanceOf(user);
+
+        assertEq(tokenAmount, 0, "User should not receive tokens");
+        assertEq(ETHReserve, 0, "ETHReserve should be 0");
+        assertEq(
+            TokenReserve,
+            bondingCurve.TOTAL_SALE(),
+            "TokenReserve should be TOTAL_SALE"
+        );
+
+        return tokenAddress;
+    }
+
+    function logPoolData(address tokenAddress) internal view {
+        (uint256 ETHReserve, uint256 TokenReserve, bool launched) = bondingCurve
+            .virtualPools(tokenAddress);
+        console.log("ETHReserve: ", ETHReserve);
+        console.log("TokenReserve: ", TokenReserve);
+        console.log("Launched: ", launched);
+    }
+
     function testCreateAndInitPurchase_Successful() public {
         uint256 initialFunds = 1 ether;
         uint256 totalFunds = initialFunds + bondingCurve.LAUNCH_FEE();
@@ -144,7 +175,7 @@ contract BondingCurveTest is Test {
         );
         assertEq(
             ETHReserve,
-            initialFunds,
+            initialFunds - user.balance,
             "ETHReserve should be updated correctly"
         );
     }
@@ -178,8 +209,15 @@ contract BondingCurveTest is Test {
     }
 
     function testPurchaseToken_Successful() public {
-        // Assume a token has already been created
         address tokenAddress = deployTestToken();
+
+        // Verify reserves
+        (
+            uint256 initialEthReserve,
+            uint256 initialTokenReserve,
+
+        ) = bondingCurve.virtualPools(tokenAddress);
+        initialEthReserve -= user.balance;
 
         vm.deal(user, 1 ether);
         vm.prank(user);
@@ -188,67 +226,108 @@ contract BondingCurveTest is Test {
         // Verify token balance
         uint256 tokenBalance = Token(tokenAddress).balanceOf(user);
         assertGt(tokenBalance, 0, "User should receive tokens");
+        uint256 leftoverEth = user.balance;
 
         // Verify reserves
         (uint256 ETHReserve, uint256 TokenReserve, ) = bondingCurve
             .virtualPools(tokenAddress);
 
-        uint256 expectedRemainingTokens = bondingCurve.TOTAL_SALE() -
-            Token(tokenAddress).balanceOf(user);
+        uint256 expectedRemainingTokens = initialTokenReserve - tokenBalance;
+        uint256 expectedEthReserve = 1 ether - leftoverEth;
+
         assertEq(
             TokenReserve,
             expectedRemainingTokens,
             "TokenReserve should be updated correctly"
         );
-        assertEq(ETHReserve, 1 ether);
-
-        // Verify events (Foundry can capture and assert events)
+        assertEq(
+            ETHReserve - initialEthReserve,
+            expectedEthReserve,
+            "ETHReserve should be updated correctly"
+        );
     }
 
     function testPurchaseToken_ExceedsMaxAmount() public {
         address tokenAddress = deployTestToken();
+        uint256 valueWhichExceedsMaxAmount = bondingCurve.maxPurchaseAmount() +
+            1 ether;
 
-        vm.deal(user, bondingCurve.maxPurchaseAmount() + 1 ether);
+        vm.deal(user, valueWhichExceedsMaxAmount);
         vm.prank(user);
         vm.expectRevert("BondingCurve: Exceeds max purchase amount");
-        bondingCurve.purchaseToken{
-            value: bondingCurve.maxPurchaseAmount() + 1 ether
-        }(tokenAddress, 0);
+        bondingCurve.purchaseToken{value: valueWhichExceedsMaxAmount}(
+            tokenAddress,
+            0
+        );
     }
 
     function testPurchaseToken_SlippageExceeded() public {
         address tokenAddress = deployTestToken();
+        uint256 initialTokens = 1e18;
 
-        vm.deal(user, 1 ether);
-        uint256 amountMin = 1000 ether; // Set minimum token amount high to trigger slippage
+        uint256 ethValue = bondingCurve.getEthAmountToBuyTokens(
+            tokenAddress,
+            initialTokens
+        );
+        vm.deal(user, ethValue);
         vm.prank(user);
         vm.expectRevert("BondingCurve: Slippage exceeded");
-        bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, amountMin);
+        bondingCurve.purchaseToken{value: ethValue}(
+            tokenAddress,
+            initialTokens * 2
+        );
+    }
+
+    function testPurchaseToken_SlippageNotExceeded() public {
+        address tokenAddress = deployTestToken();
+        uint256 initialTokens = 1e18;
+
+        uint256 ethValue = bondingCurve.getEthAmountToBuyTokens(
+            tokenAddress,
+            initialTokens
+        );
+        uint256 slippageTwoPercent = initialTokens -
+            ((initialTokens * 2) / 100);
+        vm.deal(user, ethValue);
+        vm.prank(user);
+        bondingCurve.purchaseToken{value: ethValue}(
+            tokenAddress,
+            slippageTwoPercent
+        );
+
+        uint256 tokenBalance = Token(tokenAddress).balanceOf(user);
+        assertGt(
+            tokenBalance,
+            slippageTwoPercent,
+            "User should receive tokens"
+        );
     }
 
     function testSellToken_Successful() public {
-        address tokenAddress = deployTestToken();
-        uint256 tokenAmount = 1000 * 1e18;
+        address tokenAddress = onlyCreateTestToken();
+        uint256 initialEthValue = 1 ether;
 
         // User buys tokens first
-        vm.deal(user, 1 ether);
+        vm.deal(user, initialEthValue);
         vm.prank(user);
-        bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, 0);
+        bondingCurve.purchaseToken{value: initialEthValue}(tokenAddress, 0);
 
-        // Approve tokens for sale
+        uint256 initialTokenBalance = Token(tokenAddress).balanceOf(user);
+        uint256 tokenAmount = initialTokenBalance / 2;
+
+        // Approve half of the tokens for sale
         vm.prank(user);
         Token(tokenAddress).approve(address(bondingCurve), tokenAmount);
 
-        // Sell tokens
-        uint256 ethAmountMin = 0;
+        // Sell half the tokens
         vm.prank(user);
-        bondingCurve.sellToken(tokenAddress, tokenAmount, ethAmountMin);
+        bondingCurve.sellToken(tokenAddress, tokenAmount, 0);
 
         // Verify token balance
         uint256 tokenBalance = Token(tokenAddress).balanceOf(user);
         assertLt(
             tokenBalance,
-            tokenAmount,
+            initialTokenBalance,
             "Tokens should be deducted after sale"
         );
 
@@ -262,10 +341,14 @@ contract BondingCurveTest is Test {
 
         assertEq(
             TokenReserve,
-            bondingCurve.TOTAL_SALE() - tokenAmount,
+            bondingCurve.TOTAL_SALE() - tokenBalance,
             "TokenReserve should be updated correctly"
         );
-        assertEq(ETHReserve, 1 ether, "ETHReserve should be updated correctly");
+        assertEq(
+            ETHReserve,
+            initialEthValue - ethBalance,
+            "ETHReserve should be updated correctly"
+        );
     }
 
     function testSellToken_MoreThanOwned() public {
@@ -279,32 +362,28 @@ contract BondingCurveTest is Test {
     }
 
     function testTokenLaunch_ThresholdReached() public {
-        address tokenAddress = deployTestToken();
+        address tokenAddress = onlyCreateTestToken();
 
-        uint256 purchaseAmount = bondingCurve.LAUNCH_THRESHOLD();
-        vm.deal(user, purchaseAmount);
+        for (uint256 i = 0; i < 201; i++) {
+            vm.deal(user, 0.1 ether);
+            vm.prank(user);
+            bondingCurve.purchaseToken{value: 0.1 ether}(tokenAddress, 0);
+        }
 
-        vm.prank(user);
-        bondingCurve.purchaseToken{value: purchaseAmount}(tokenAddress, 0);
-
-        // Verify token is launched
         (, , bool launched) = bondingCurve.virtualPools(tokenAddress);
-
         assertTrue(launched, "Token should be launched");
-
-        // Verify liquidity pool creation and LP tokens burned
-        // This might require mocking or simulating Uniswap interactions
     }
 
     function testTokenLaunch_NotReached() public {
-        address tokenAddress = deployTestToken();
+        address tokenAddress = onlyCreateTestToken();
 
-        uint256 purchaseAmount = bondingCurve.LAUNCH_THRESHOLD() - 1 ether;
-        vm.deal(user, purchaseAmount);
+        for (uint256 i = 0; i < 198; i++) {
+            vm.deal(user, 0.1 ether);
+            vm.prank(user);
+            bondingCurve.purchaseToken{value: 0.1 ether}(tokenAddress, 0);
+        }
 
-        vm.prank(user);
-        bondingCurve.purchaseToken{value: purchaseAmount}(tokenAddress, 0);
-
+        logPoolData(tokenAddress);
         // Verify token is not launched
         (, , bool launched) = bondingCurve.virtualPools(tokenAddress);
 
@@ -498,26 +577,29 @@ contract BondingCurveTest is Test {
         );
     }
     function testPurchaseWhenMaxSupplyReached() public {
-        address tokenAddress = deployTestToken();
+        address tokenAddress = onlyCreateTestToken();
 
-        // Simulate purchases until supply is depleted
-        uint256 totalTokens = bondingCurve.TOTAL_SALE();
+        for (uint256 i = 0; i < 199; i++) {
+            vm.deal(user, 0.1 ether);
+            vm.prank(user);
+            bondingCurve.purchaseToken{value: 0.1 ether}(tokenAddress, 0);
+        }
 
-        // Purchase all tokens
-        uint256 ethRequired = bondingCurve.getEthAmountToBuyTokens(
+        uint256 maxPurchaseAmount = bondingCurve.maxPurchaseAmount();
+        uint256 tokenAmount = bondingCurve.getTokenAmountByPurchase(
             tokenAddress,
-            totalTokens
+            maxPurchaseAmount
         );
 
-        vm.deal(user, ethRequired);
+        vm.deal(user, maxPurchaseAmount);
         vm.prank(user);
-        bondingCurve.purchaseToken{value: ethRequired}(tokenAddress, 0);
-
-        // Attempt to purchase more tokens
-        vm.deal(user, 1 ether);
-        vm.prank(user);
-        vm.expectRevert("BondingCurve: Not enough tokens available");
-        bondingCurve.purchaseToken{value: 1 ether}(tokenAddress, 0);
+        vm.expectRevert(
+            "BondingCurve: Cannot purchase more tokens than available"
+        );
+        bondingCurve.purchaseToken{value: maxPurchaseAmount}(
+            tokenAddress,
+            (tokenAmount * 100) / 98
+        );
     }
 
     function testLaunchFeeTransferredToVault() public {

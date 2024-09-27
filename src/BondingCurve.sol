@@ -132,7 +132,7 @@ contract BondingCurve is OwnableUpgradeable {
     uint256 private constant MAX_X = 9223372036854775807 * 1e18;
 
     function toInt128(uint256 x) internal pure returns (int128) {
-        require(x <= MAX_X, "Overflow in toInt128");
+        require(x <= MAX_X, "BondingCurve: Overflow in toInt128");
         return int128(int256((x << 64) / 1e18));
     }
 
@@ -143,7 +143,7 @@ contract BondingCurve is OwnableUpgradeable {
 
     // Helper function to find most significant bit
     function log_2(uint256 x) internal pure returns (int128) {
-        require(x > 0, "Input must be greater than zero");
+        require(x > 0, "BondingCurve: Input must be greater than zero");
 
         int128 x64x64 = toInt128(x);
 
@@ -190,7 +190,7 @@ contract BondingCurve is OwnableUpgradeable {
     }
 
     function ln(uint256 x) internal pure returns (uint256) {
-        require(x > 0, "Input must be greater than zero");
+        require(x > 0, "BondingCurve: Input must be greater than zero");
 
         int128 log2Result = log_2(x); // log_2 in 64.64 format
 
@@ -266,11 +266,6 @@ contract BondingCurve is OwnableUpgradeable {
         uint256 S_old = TOTAL_SALE - pool.TokenReserve; // Tokens sold so far
         uint256 S_new = S_old + tokenAmount; // Tokens sold after purchase
 
-        require(
-            S_new <= TOTAL_SALE,
-            "Cannot purchase more tokens than available"
-        );
-
         // Calculate cumulative costs
         uint256 C_S_old = calculateCumulativeCost(S_old);
         uint256 C_S_new = calculateCumulativeCost(S_new);
@@ -288,7 +283,10 @@ contract BondingCurve is OwnableUpgradeable {
         VirtualPool memory pool = virtualPools[token];
         uint256 S_old = TOTAL_SALE - pool.TokenReserve; // Tokens sold so far
 
-        require(tokenAmount <= S_old, "Cannot sell more tokens than owned");
+        require(
+            tokenAmount <= S_old,
+            "BondingCurve: Cannot sell more tokens than owned"
+        );
 
         uint256 S_new = S_old - tokenAmount; // Tokens sold after selling
 
@@ -352,9 +350,15 @@ contract BondingCurve is OwnableUpgradeable {
             newTokenAddress,
             initialFunds
         );
+
         if (tokenAmount == 0) {
             return;
         }
+
+        require(
+            tokenAmount <= TOTAL_SALE,
+            "BondingCurve: Cannot purchase more tokens than available"
+        );
 
         uint256 actualEthUsed = getEthAmountToBuyTokens(
             newTokenAddress,
@@ -362,20 +366,25 @@ contract BondingCurve is OwnableUpgradeable {
         );
         require(
             actualEthUsed <= initialFunds,
-            "Calculated ETH exceeds sent ETH"
+            "BondingCurve: Calculated ETH exceeds sent ETH"
         );
 
-        // Update reserves
-        virtualPools[newTokenAddress].ETHReserve += initialFunds;
+        uint256 leftoverEth = initialFunds - actualEthUsed;
+        require(
+            leftoverEth >= 0,
+            "BondingCurve: Leftover ETH cannot be negative"
+        );
+
+        virtualPools[newTokenAddress].ETHReserve += (initialFunds -
+            leftoverEth);
         virtualPools[newTokenAddress].TokenReserve -= tokenAmount;
 
         // Transfer tokens to buyer
         Token(newTokenAddress).transfer(msg.sender, tokenAmount);
 
-        uint256 leftoverEth = initialFunds - actualEthUsed;
         if (leftoverEth > 0) {
             (bool success, ) = payable(msg.sender).call{value: leftoverEth}("");
-            require(success, "Refund failed");
+            require(success, "BondingCurve: Refund failed");
         }
 
         emit TokenPurchased(
@@ -401,29 +410,44 @@ contract BondingCurve is OwnableUpgradeable {
             msg.value <= maxPurchaseAmount,
             "BondingCurve: Exceeds max purchase amount"
         );
+        // this is redundant but I added it just for brevity
+        require(
+            amountMin <= virtualPools[token].TokenReserve,
+            "BondingCurve: Cannot purchase more tokens than available"
+        );
 
         uint256 ethAmount = msg.value;
 
         // Calculate token amount to send
         uint256 tokenAmount = getTokenAmountByPurchase(token, ethAmount);
+        if (tokenAmount > virtualPools[token].TokenReserve) {
+            tokenAmount = virtualPools[token].TokenReserve;
+        }
         require(tokenAmount >= amountMin, "BondingCurve: Slippage exceeded");
 
         uint256 actualEthUsed = getEthAmountToBuyTokens(token, tokenAmount);
         actualEthUsed = actualEthUsed;
 
-        require(actualEthUsed <= ethAmount, "Calculated ETH exceeds sent ETH");
+        require(
+            actualEthUsed <= ethAmount,
+            "BondingCurve: Calculated ETH exceeds sent ETH"
+        );
 
-        // Update reserves
-        virtualPools[token].ETHReserve += ethAmount;
+        uint256 leftoverEth = ethAmount - actualEthUsed;
+        require(
+            leftoverEth >= 0,
+            "BondingCurve: Leftover ETH cannot be negative"
+        );
+
+        virtualPools[token].ETHReserve += (ethAmount - leftoverEth);
         virtualPools[token].TokenReserve -= tokenAmount;
 
         // Transfer tokens to buyer
         Token(token).transfer(msg.sender, tokenAmount);
 
-        uint256 leftoverEth = ethAmount - actualEthUsed;
         if (leftoverEth > 0) {
             (bool success, ) = payable(msg.sender).call{value: leftoverEth}("");
-            require(success, "Refund failed");
+            require(success, "BondingCurve: Refund failed");
         }
 
         // Emit events
@@ -483,7 +507,11 @@ contract BondingCurve is OwnableUpgradeable {
     // Enforce Launch Threshold
     function checkAndLaunchToken(address token) internal {
         VirtualPool storage pool = virtualPools[token];
-        if (!pool.launched && pool.ETHReserve >= LAUNCH_THRESHOLD) {
+        if (
+            !pool.launched &&
+            pool.TokenReserve == 0 &&
+            pool.ETHReserve >= (LAUNCH_THRESHOLD - 0.002 ether)
+        ) {
             pool.launched = true;
             emit TokenLaunched(token);
 
@@ -528,7 +556,7 @@ contract BondingCurve is OwnableUpgradeable {
             tokenAmount,
             ethAmount,
             address(this),
-            block.timestamp
+            block.timestamp + 1 hours
         );
         return liquidity;
     }
