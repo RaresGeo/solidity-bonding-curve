@@ -394,6 +394,9 @@ contract BondingCurve is OwnableUpgradeable {
             tokenAmount,
             virtualPools[newTokenAddress].TokenReserve
         );
+
+        uint256 newPrice = getEthAmountToBuyTokens(newTokenAddress, ONE);
+        emit PriceChanged(newTokenAddress, newPrice);
     }
 
     function purchaseToken(address token, uint256 amountMin) external payable {
